@@ -3,68 +3,66 @@
 
 LOG_MODULE_REGISTER(demo, LOG_LEVEL_DBG);
 
-#define STACK_SIZE 1024
+#define STACK_SIZE 	1024
+#define PRIO 		3
+#define INCREMENTS 	1000000
 
-#define PRIO_COOP (-1)
-#define PRIO_HIGH 3
-#define PRIO_MED  5
-#define PRIO_LOW  7
+volatile static uint32_t counter;
 
-#define COOP_ITER 5
+static struct k_sem done_sem;
 
-void t_coop_fn(void *p1, void *p2, void *p3)
+K_MUTEX_DEFINE(increment_mutex);
+
+void t_increment_fn(void *p1, void *p2, void *p3)
 {
-    while(1) {
-	LOG_INF("T_COOP running");
+    const char *name = k_thread_name_get(k_current_get());
 
-	for(int i=0; i < COOP_ITER; i++) {
-	    LOG_INF(" Iteration %d of %d", i, COOP_ITER);
-	    k_busy_wait(50000);
+    for (int i = 0; i < INCREMENTS; i++) {
+	k_mutex_lock(&increment_mutex, K_FOREVER);
+	counter++;
+
+	if (counter % 100000 == 0) {
+	    LOG_INF("[%s] counted to %d", name, counter);
 	}
 
-	LOG_INF("T_COOP yielding");
-	k_yield();
-
-	LOG_INF("T_COOP done");
-	k_msleep(500);
+	k_mutex_unlock(&increment_mutex);
     }
+
+    // Release a semaphore, incrementing its count by 1
+    k_sem_give(&done_sem);
+    LOG_INF("[%s] finished", name);
 }
 
-void t_high_fn(void *p1, void *p2, void *p3)
-{
-    while (1) {
-	LOG_INF("T_HIGH running");
-        k_msleep(100);
-    }
-}
-
-void t_med_fn(void *p1, void *p2, void *p3)
-{
-    while (1) {
-	LOG_INF("T_MED running");
-        k_msleep(200);
-    }
-}
-
-void t_low_fn(void *p1, void *p2, void *p3)
-{
-    while(1) {
-        LOG_INF("T_LOW running");
-	k_msleep(300);
-    }
-}
-
-K_THREAD_DEFINE(thread_c, STACK_SIZE, t_coop_fn,
-		NULL, NULL, NULL, PRIO_COOP, 0, 0);
-K_THREAD_DEFINE(thread_h, STACK_SIZE, t_high_fn,
-                NULL, NULL, NULL, PRIO_HIGH, 0, 0);
-K_THREAD_DEFINE(thread_m, STACK_SIZE, t_med_fn,
-                NULL, NULL, NULL, PRIO_MED, 0, 0);
-K_THREAD_DEFINE(thread_l, STACK_SIZE, t_low_fn,
-		NULL, NULL, NULL, PRIO_LOW, 0, 0);
+K_THREAD_DEFINE(thread_a, STACK_SIZE, t_increment_fn,
+                NULL, NULL, NULL, PRIO, 0, 0);
+K_THREAD_DEFINE(thread_b, STACK_SIZE, t_increment_fn,
+		NULL, NULL, NULL, PRIO, 0, 0);
 
 int main(void)
 {
+    k_sem_init(&done_sem, 0, 2);
+
+    int64_t time = k_uptime_get();
+    int32_t expected_value = INCREMENTS * 2;
+
+    LOG_INF("=== L2 Assignment: Mutex Protection ===");
+    LOG_INF("Expected final value: %d", expected_value);
+
+    // Stop thread and wait until the semaphore becomes available
+    k_sem_take(&done_sem, K_FOREVER);
+    k_sem_take(&done_sem, K_FOREVER);
+
+    LOG_INF("Actual final value: %u", counter);
+
+    if (counter == expected_value) {
+        LOG_WRN("No race this run");
+    }
+    else {
+        LOG_ERR("Race condition confirmed: lost %d updates",
+                expected_value - counter);
+    }
+
+    LOG_INF("Execution time: %lld ms", k_uptime_delta(&time));
+
     return 0;
 }
-
