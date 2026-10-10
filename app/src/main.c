@@ -1,42 +1,17 @@
 /*
- * Lecture 3 - Homework Starter Code
+ * Lecture 4 Task 1
  *
- * GOAL: Convert a polling loop to an event-driven workqueue architecture.
- *
- * The starter code works but is INEFFICIENT.
- * polling_thread wakes every 10ms to check a flag.
- * sensor_sim fires every 100ms - that's 10 wasted wake-ups per event.
+ * GOAL: Build a small event-driven system with zbus
  *
  *
  * ================================================================
  * TASKS
  * ================================================================
  *
- * TASK 1 (starter - already works, just run it):
- *   Run the starter. Count wake-ups vs real events in the log.
- *   Expected: ~10 wake-ups per sensor event. Confirm this.
- *
- * TASK 2 (implement):
- *   Replace polling_thread with a k_work handler.
- *   sensor_sim should call k_work_submit() instead of setting a flag.
- *   The handler should do what polling_thread currently does.
- *
- *   Steps:
- *   - Define a work item with K_WORK_DEFINE
- *   - Write the handler function
- *   - In sensor_sim: call k_work_submit() (remove k_sem_give + flag)
- *   - Remove the polling_thread entirely
- *
- * TASK 3 (verify):
- *   Add k_uptime_get_32() to your handler's LOG_INF.
- *   Confirm handler runs only when sensor_sim fires (every ~100ms).
- *   No unnecessary wake-ups.
- *
- * BONUS (debounce):
- *   Change sensor_sim to fire 5 events within 20ms (not 1 per 100ms).
- *   Use k_work_reschedule with 30ms delay so only ONE handler
- *   call occurs after the burst - not 5.
- *   Log the reschedule timestamps to confirm the burst collapses.
+ * - Create one zbus channel for sensor data
+ * - Publish simulated sensor samples every 100 ms
+ * - Add one listener for fast display updates
+ * - Add one subscriber for slower logging
  *
  * ================================================================
  */
@@ -44,153 +19,171 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <stdbool.h>
+#include <zephyr/zbus/zbus.h>
 
 LOG_MODULE_REGISTER(homework, LOG_LEVEL_DBG);
 
-#define STACK_SIZE 	1024
-#define PRIO 		3
-#define INCREMENTS 	1000000
+#define STACK_SIZE 1024
+#define SENSOR_ITERATIONS 6
+#define SENSOR_PERIOD_MS  100
+#define PRESSURE_THRS     15
 
-volatile static uint32_t counter;
+/* ================================================================== */
+/*  Shared channel message                                            */
+/* ================================================================== */
 
-static struct k_sem done_sem;
+struct sensor_data {
+    int32_t pressure_psi;
+    uint32_t timestamp_ms;
+    uint8_t seq;
+};
 
-K_MUTEX_DEFINE(increment_mutex);
+/* Forward declarations required before observer/channel definitions. */
+static void valve_listener_cb(const struct zbus_channel *chan);
 
-void t_increment_fn(void *p1, void *p2, void *p3)
+/* ================================================================== */
+/*  Observers                                                         */
+/* ================================================================== */
+
+/* Critical task: Valve control in chamber */
+ZBUS_LISTENER_DEFINE(valve_lis, valve_listener_cb);
+
+/* Slow task: Display updates from message copies */
+ZBUS_MSG_SUBSCRIBER_DEFINE(display_sub);
+
+/* ================================================================== */
+/*  Channel                                                           */
+/* ================================================================== */
+
+ZBUS_CHAN_DEFINE(sensor_chan, struct sensor_data,
+                 NULL, NULL,
+                 ZBUS_OBSERVERS(valve_lis, display_sub),
+                 ZBUS_MSG_INIT(.pressure_psi = 0,
+                               .timestamp_ms = 0,
+                               .seq = 0));
+
+
+/* ================================================================== */
+/*  Listener - synchronous observer                                   */
+/* ================================================================== */
+
+static void valve_listener_cb(const struct zbus_channel *chan)
 {
-    const char *name = k_thread_name_get(k_current_get());
+    const struct sensor_data *msg =
+        (const struct sensor_data *)zbus_chan_const_msg(chan);
 
-    for (int i = 0; i < INCREMENTS; i++) {
-	k_mutex_lock(&increment_mutex, K_FOREVER);
-	counter++;
-
-	if (counter % 100000 == 0) {
-	    LOG_INF("[%s] counted to %d", name, counter);
-	}
-
-	k_mutex_unlock(&increment_mutex);
+    /*
+     * Listener runs in publisher context.
+     * Keep it short. No blocking work here.
+     */
+    LOG_INF("[VALVE-LIS] thread=%s seq=%u pres=%d PSI",
+            k_thread_name_get(k_current_get()),
+            msg->seq,
+            msg->pressure_psi);
+    
+    if(msg->pressure_psi > PRESSURE_THRS) {
+        LOG_INF("[VALVE-LIS] Valve opened");
     }
-
-    // Release a semaphore, incrementing its count by 1
-    k_sem_give(&done_sem);
-    LOG_INF("[%s] finished", name);
 }
 
-K_THREAD_DEFINE(thread_a, STACK_SIZE, t_increment_fn,
-                NULL, NULL, NULL, PRIO, 0, 0);
-K_THREAD_DEFINE(thread_b, STACK_SIZE, t_increment_fn,
-		NULL, NULL, NULL, PRIO, 0, 0);
 
-int main(void)
+/* ================================================================== */
+/*  Publisher                                                         */
+/* ================================================================== */
+
+static void sensor_thread_fn(void *p1, void *p2, void *p3)
 {
-    k_sem_init(&done_sem, 0, 2);
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-    int64_t time = k_uptime_get();
-    int32_t expected_value = INCREMENTS * 2;
+    k_thread_name_set(k_current_get(), "sensor");
 
-    LOG_INF("=== L2 Assignment: Mutex Protection ===");
-    LOG_INF("Expected final value: %d", expected_value);
+    for (int i = 0; i < SENSOR_ITERATIONS; i++) {
+        struct sensor_data data = {
+            .pressure_psi = 12 + i,
+            .timestamp_ms = k_uptime_get_32(),
+            .seq = (uint8_t)i,
+        };
 
-    // Stop thread and wait until the semaphore becomes available
-    k_sem_take(&done_sem, K_FOREVER);
-    k_sem_take(&done_sem, K_FOREVER);
+        LOG_INF("[SENSOR] publish seq=%u pres=%d PSI",
+                data.seq,
+                data.pressure_psi);
 
-    LOG_INF("Actual final value: %u", counter);
+        int ret = zbus_chan_pub(&sensor_chan, &data, K_MSEC(50));
+        if (ret != 0) {
+            LOG_WRN("[SENSOR] publish failed ret=%d", ret);
+        }
 
-    if (counter == expected_value) {
-        LOG_WRN("No race this run");
+        k_msleep(SENSOR_PERIOD_MS);
     }
-    else {
-        LOG_ERR("Race condition confirmed: lost %d updates",
-                expected_value - counter);
-    }
 
-    LOG_INF("Execution time: %lld ms", k_uptime_delta(&time));
-
-#define STACK_SIZE    1024
-#define SENSOR_MS     20    /* sensor burst every 20 ms */
-#define EVENT_COUNT   5     /* total sensor events to produce */
-
-/* Statistics */
-static int total_events;
-static int total_wakeups;
-static int total_processed;
-
-/* ================================================================
- * TASK 2 PLACEHOLDER - implement your solution here
- * ================================================================ */
-
-static void sensor_handler(struct k_work *work) {
-    ARG_UNUSED(work);
-    total_processed++;
-    total_wakeups++;
-    LOG_INF("[HANDLER] processed event %d  wakeups_so_far %d tick=%u",
-            total_processed, total_wakeups,
-            k_uptime_get_32());
+    LOG_INF("[SENSOR] done");
 }
 
-K_WORK_DELAYABLE_DEFINE(debounce_work, sensor_handler);
+/* ================================================================== */
+/*  Message subscriber - logger                                       */
+/* ================================================================== */
 
-/* ------------------------------------------------------------------ */
-/*  sensor_sim - fires EVENT_COUNT events, 100ms apart               */
-/* ------------------------------------------------------------------ */
-
-static void sensor_sim_fn(void *p1, void *p2, void *p3)
+static void display_thread_fn(void *p1, void *p2, void *p3)
 {
-    for (int i = 0; i < EVENT_COUNT; i++) {
-        k_msleep(SENSOR_MS);
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-        total_events++;
-        LOG_INF("[SENSOR DEBOUNCE] event %d  tick=%u", i, k_uptime_get_32());
+    k_thread_name_set(k_current_get(), "display");
+
+    const struct zbus_channel *chan;
+    int received = 0;
+
+    while (received < SENSOR_ITERATIONS) {
+        struct sensor_data msg;
 
         /*
-         * STARTER: set a flag for the polling thread.
-         *
-         * TASK 2: Replace these two lines with:
-         *   int ret = k_work_submit(&sensor_work);
-         *   if (ret < 0) { LOG_ERR("submit failed: %d", ret); }
-         *
-         * Remove sensor_flag entirely once you do that.
+         * Message subscribers receive a copy of the published message.
+         * The slow display will not reread the latest channel value.
          */
-	int ret = k_work_reschedule(&debounce_work, K_MSEC(30));
-	if (ret < 0) {
-		LOG_ERR("Failed to submit: %d", ret);
-	}
+        int ret = zbus_sub_wait_msg(&display_sub, &chan, &msg, K_MSEC(1500));
+        if (ret != 0) {
+            LOG_WRN("[DISPLAY-MSG] timeout ret=%d", ret);
+            break;
+        }
+
+        received++;
+
+        LOG_INF("[DISPLAY-MSG] thread=%s seq=%u pres=%d latency=%ums",
+                k_thread_name_get(k_current_get()),
+                msg.seq,
+                msg.pressure_psi,
+                k_uptime_get_32() - msg.timestamp_ms);
 
         /*
-         * BONUS: Replace the single k_msleep(SENSOR_MS) above with
-         * a burst of 5 rapid events, then use k_work_reschedule in
-         * the handler to collapse them to one execution.
+         * Slow display.
+         * Message copies let it process old samples safely.
          */
+        k_msleep(150);
     }
 
-    LOG_INF("[SENSOR] all events produced");
+    LOG_INF("[DISPLAY-MSG] done received=%d", received);
 }
 
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 /*  Threads                                                           */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 
-K_THREAD_DEFINE(sensor_thread,  STACK_SIZE, sensor_sim_fn, NULL, NULL, NULL, 5, 0, 0);
+K_THREAD_DEFINE(sensor_thread, STACK_SIZE, sensor_thread_fn,
+                NULL, NULL, NULL, 5, 0, 0);
+
+K_THREAD_DEFINE(display_thread, STACK_SIZE, display_thread_fn,
+                NULL, NULL, NULL, 6, 0, 0);
+
+/* ================================================================== */
+/*  Main                                                              */
+/* ================================================================== */
 
 int main(void)
 {
-    LOG_INF("=== L3 Homework: Polling to Workqueue ===");
-    LOG_INF("Starter: polling disabled, sensor fires every %dms",
-            SENSOR_MS);
-    LOG_INF("Run this, count wakeups, then convert to workqueue.");
-    LOG_INF("--- simulating 5 rapid button events ---");
-
-    /* Wait long enough for all events to complete */
-    k_msleep((EVENT_COUNT + 2) * SENSOR_MS + 500);
-
-    /* Summary after all events processed */
-    LOG_INF("\n");
-    LOG_INF("[SUMMARY] events=%d  total_wakeups=%d  wasted=%d",
-            total_processed,
-            total_wakeups,
-            total_wakeups - total_processed);
+    LOG_INF("=== L4 Task: Zbus Pub-Sub ===");
+    LOG_INF("sensor publishes every %dms", SENSOR_PERIOD_MS);
+    LOG_INF("valve listener runs in publisher context");
+    LOG_INF("display uses message subscriber copies");
+    LOG_INF("valve threshold: %d PSI", PRESSURE_THRS);
 
     return 0;
 }
